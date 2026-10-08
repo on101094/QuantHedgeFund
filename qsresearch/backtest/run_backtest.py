@@ -26,6 +26,12 @@ from qsresearch.portfolio_analysis.performance_metrics import calculate_all_metr
 SIMULATOR_VERSION = "signal_weights_v2"
 DEFAULT_REBALANCE_FREQUENCY = "M"
 DEFAULT_TRANSACTION_COST_BPS = 5.0
+# Return applied to a position when its symbol stops trading before the data
+# ends. The data has no delisting returns or reasons, so this is an assumption:
+# -30% is the standard replacement for a missing performance-related delisting
+# return (Shumway 1997). It is also applied to mergers and ticker changes,
+# which usually lose much less, so it errs on the conservative side.
+DEFAULT_DELISTING_RETURN = -0.30
 REBALANCE_FREQUENCIES = {"D", "W", "M", "Q"}
 
 
@@ -60,6 +66,8 @@ def run_backtest(
             - simulation: Optional simulator settings
                 - rebalance_frequency: 'D', 'W', 'M' (default) or 'Q'
                 - transaction_cost_bps: cost per unit of turnover (default 5)
+                - delisting_return: return a held position takes when its
+                  symbol stops trading before the data ends (default -0.30)
                 - warmup_days: trading days of history loaded before
                   start_date so factors and the universe screener are
                   ready on day one (default: longest factor or screener
@@ -87,6 +95,7 @@ def run_backtest(
     simulation_config = {
         "rebalance_frequency": DEFAULT_REBALANCE_FREQUENCY,
         "transaction_cost_bps": DEFAULT_TRANSACTION_COST_BPS,
+        "delisting_return": DEFAULT_DELISTING_RETURN,
         **config.get("simulation", {}),
     }
     warmup_days = simulation_config.get("warmup_days")
@@ -118,6 +127,7 @@ def run_backtest(
             "simulator": SIMULATOR_VERSION,
             "sim.rebalance_frequency": simulation_config["rebalance_frequency"],
             "sim.transaction_cost_bps": simulation_config["transaction_cost_bps"],
+            "sim.delisting_return": simulation_config["delisting_return"],
             "sim.warmup_days": warmup_days,
             "sim.data_start_date": data_start_date,
         })
@@ -131,6 +141,9 @@ def run_backtest(
         )
         price_data = _load_price_data(bundle_name, data_start_date, end_date)
         _check_warmup_coverage(price_data, start_date, warmup_days)
+        # Taken before preprocessing, which can drop a symbol's final rows
+        # (gaps, thin days) without the symbol having delisted
+        simulation_config["last_trade_dates"] = _last_trade_dates(price_data)
 
         # Step 2: Apply preprocessing
         logger.info("Applying preprocessing steps...")
@@ -264,6 +277,12 @@ def _check_warmup_coverage(prices: pd.DataFrame, start_date: str, warmup_days: i
         )
 
 
+def _last_trade_dates(prices: pd.DataFrame) -> pd.Series:
+    """Last date with a close for each symbol, indexed by symbol."""
+    traded = prices.loc[prices["close"].notna(), ["symbol", "date"]]
+    return pd.to_datetime(traded["date"]).groupby(traded["symbol"]).max()
+
+
 def _load_price_data(
     bundle_name: str,
     start_date: str,
@@ -387,6 +406,8 @@ def _run_algorithm(
         end_date,
         rebalance_frequency=simulation_config.get("rebalance_frequency", DEFAULT_REBALANCE_FREQUENCY),
         transaction_cost_bps=simulation_config.get("transaction_cost_bps", DEFAULT_TRANSACTION_COST_BPS),
+        delisting_return=simulation_config.get("delisting_return", DEFAULT_DELISTING_RETURN),
+        last_trade_dates=simulation_config.get("last_trade_dates"),
     )
     
     return performance
@@ -400,6 +421,8 @@ def _simulate_portfolio(
     end_date: str,
     rebalance_frequency: str = DEFAULT_REBALANCE_FREQUENCY,
     transaction_cost_bps: float = DEFAULT_TRANSACTION_COST_BPS,
+    delisting_return: float = DEFAULT_DELISTING_RETURN,
+    last_trade_dates: Optional[pd.Series] = None,
 ) -> pd.DataFrame:
     """
     Simulate a portfolio that holds the signal weights.
@@ -414,6 +437,11 @@ def _simulate_portfolio(
     turnover * transaction_cost_bps / 10,000, where turnover is the sum of
     |target weight - drifted weight| across symbols.
     
+    A symbol delists when its last trade comes before the last date of the
+    price data. On the first trading day after its last trade, a held position
+    earns delisting_return instead of the stale forward-filled zero, and what
+    is left of it moves to cash at no trading cost.
+    
     Args:
         signals: Long-format frame with 'date', 'symbol' and 'weight' columns
         prices: Long-format frame with 'date', 'symbol' and 'close' columns
@@ -422,10 +450,14 @@ def _simulate_portfolio(
         end_date: Last date of the simulation window
         rebalance_frequency: 'D' (every signal date), 'W', 'M' or 'Q'
         transaction_cost_bps: Cost per unit of turnover, in basis points
+        delisting_return: Return of a held position on its delisting day
+        last_trade_dates: Last trade date per symbol (indexed by symbol), from
+            the raw data; defaults to the last close in prices
     
     Returns:
-        DataFrame with date, portfolio_value, returns, turnover and
-        transaction_cost (as a fraction of portfolio value) per trading day
+        DataFrame with date, portfolio_value, returns, turnover,
+        transaction_cost (as a fraction of portfolio value) and delisted_weight
+        (weight held in symbols delisting that day) per trading day
     
     Raises:
         BacktestDataError: If prices or signals are missing or empty
@@ -439,6 +471,8 @@ def _simulate_portfolio(
         )
     if transaction_cost_bps < 0:
         raise ValueError(f"transaction_cost_bps must be >= 0, got {transaction_cost_bps}")
+    if delisting_return < -1.0:
+        raise ValueError(f"delisting_return must be >= -1, got {delisting_return}")
 
     if prices is None or prices.empty:
         raise BacktestDataError("Price data is empty; cannot simulate a portfolio")
@@ -500,26 +534,45 @@ def _simulate_portfolio(
         )
     
     cost_rate = transaction_cost_bps / 10_000
-    returns_matrix = asset_returns.to_numpy()
+    returns_matrix = asset_returns.to_numpy().copy()
     held = np.zeros(returns_matrix.shape[1])  # weights carried into the day
+    
+    # Delisting day per symbol: the first trading day after its last trade, when
+    # that trade comes before the end of the data
+    if last_trade_dates is None:
+        last_trade_dates = _last_trade_dates(px)
+    last_trade = pd.to_datetime(last_trade_dates.reindex(close.columns)).fillna(close.index[-1])
+    delist_day = asset_returns.index.searchsorted(last_trade.to_numpy(), side="right")
+    gone = (last_trade < close.index[-1]).to_numpy() & (delist_day < len(asset_returns))
+    delist_matrix = np.zeros(returns_matrix.shape, dtype=bool)
+    for j in np.flatnonzero(gone):
+        delist_matrix[delist_day[j], j] = True
+        returns_matrix[delist_day[j], j] = delisting_return
     
     port_returns = np.zeros(len(asset_returns))
     turnovers = np.zeros(len(asset_returns))
     costs = np.zeros(len(asset_returns))
+    delisted_weights = np.zeros(len(asset_returns))
     
     for i, date in enumerate(asset_returns.index):
         # 1. Weights set at the previous close earn today's returns
         day_ret = returns_matrix[i]
         gross = float(held @ day_ret)
+        delisting_today = delist_matrix[i]
+        delisted_weights[i] = float(held[delisting_today].sum())
         if gross > -1.0:
             held = held * (1.0 + day_ret) / (1.0 + gross)
         else:
             held = np.zeros_like(held)
+        # What is left of a delisted position is paid out in cash
+        held[delisting_today] = 0.0
     
         # 2. Trade to target at today's close; these weights earn tomorrow
         cost = 0.0
         if date in rebalance_set:
-            target = targets.loc[date].to_numpy()
+            target = targets.loc[date].to_numpy().copy()
+            # Never trade into a symbol on or after its delisting day
+            target[gone & (delist_day <= i)] = 0.0
             turnovers[i] = float(np.abs(target - held).sum())
             cost = turnovers[i] * cost_rate
             held = target
@@ -527,6 +580,13 @@ def _simulate_portfolio(
         port_returns[i] = (1.0 + gross) * (1.0 - cost) - 1.0
     
     portfolio_value = capital_base * np.cumprod(1.0 + port_returns)
+    
+    hits = int((delisted_weights > 0).sum())
+    if hits:
+        logger.warning(
+            f"{hits} delisting day(s) hit held positions; each was charged a "
+            f"{delisting_return:.0%} delisting return (simulation.delisting_return)"
+        )
     
     logger.info(
         f"Simulated {len(asset_returns)} days, {len(rebalance_dates)} rebalances "
@@ -540,6 +600,7 @@ def _simulate_portfolio(
         "returns": port_returns,
         "turnover": turnovers,
         "transaction_cost": costs,
+        "delisted_weight": delisted_weights,
     })
 
 

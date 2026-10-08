@@ -268,3 +268,112 @@ class TestFactorSignal:
         assert list(day1["symbol"]) == ["C"] and day1["weight"].iloc[0] == pytest.approx(1.0)
         assert set(signals.loc[signals["date"] == dates[2], "symbol"]) == {"A", "B"}
         assert signals["factor_value"].notna().all()
+
+
+class TestDelisting:
+    """A held position must not ride a stale forward-filled price through a delisting."""
+    
+    def _prices(self, dates, delist_after=4):
+        # A gains 1% a day and stops trading after day `delist_after`; B is flat to the end
+        prices = _prices_from_returns({"A": 0.01, "B": 0.0}, dates)
+        last_a = dates[delist_after]
+        return prices[(prices["symbol"] == "B") | (prices["date"] <= last_a)].reset_index(drop=True)
+    
+    def _run(self, prices, dates, **kwargs):
+        signals = pd.DataFrame({"date": [dates[0]], "symbol": ["A"], "weight": [1.0]})
+        return _simulate_portfolio(
+            signals, prices, 100.0, str(dates[0].date()), str(dates[-1].date()),
+            rebalance_frequency="D", transaction_cost_bps=0.0, **kwargs,
+        )
+    
+    def test_held_position_takes_delisting_return_then_cash(self):
+        dates = pd.bdate_range("2024-01-01", periods=10)
+        
+        perf = self._run(self._prices(dates), dates).set_index("date")
+        
+        # Days 1-4 earn A's 1%; day 5 is the delisting day; then the book is cash
+        assert perf.loc[dates[4], "returns"] == pytest.approx(0.01)
+        assert perf.loc[dates[5], "returns"] == pytest.approx(-0.30)
+        assert perf.loc[dates[5], "delisted_weight"] == pytest.approx(1.0)
+        assert (perf.loc[dates[6]:, "returns"] == 0.0).all()
+        assert perf["portfolio_value"].iloc[-1] == pytest.approx(100.0 * 1.01 ** 4 * 0.70)
+        # Leaving the delisted position is a payout, not a trade
+        assert perf.loc[dates[5], "turnover"] == pytest.approx(0.0)
+    
+    def test_delisting_return_is_configurable(self):
+        dates = pd.bdate_range("2024-01-01", periods=10)
+        
+        perf = self._run(self._prices(dates), dates, delisting_return=0.0)
+        
+        assert perf["portfolio_value"].iloc[-1] == pytest.approx(100.0 * 1.01 ** 4)
+        with pytest.raises(ValueError):
+            self._run(self._prices(dates), dates, delisting_return=-1.5)
+    
+    def test_symbol_trading_to_the_end_is_not_delisted(self):
+        dates = pd.bdate_range("2024-01-01", periods=10)
+        prices = _prices_from_returns({"A": 0.01, "B": 0.0}, dates)
+        
+        perf = self._run(prices, dates)
+        
+        assert perf["delisted_weight"].sum() == 0.0
+        assert perf["portfolio_value"].iloc[-1] == pytest.approx(100.0 * 1.01 ** 9)
+    
+    def test_rows_dropped_by_preprocessing_are_not_a_delisting(self):
+        dates = pd.bdate_range("2024-01-01", periods=10)
+        raw = _prices_from_returns({"A": 0.01, "B": 0.0}, dates)
+        # Preprocessing dropped A's last two rows, but the raw data shows it still trading
+        processed = raw[~((raw["symbol"] == "A") & (raw["date"] > dates[7]))]
+        last_trades = raw.groupby("symbol")["date"].max()
+        
+        perf = self._run(processed, dates, last_trade_dates=last_trades)
+        
+        assert perf["delisted_weight"].sum() == 0.0
+        assert perf["returns"].min() >= 0.0
+    
+    def test_delisted_symbol_is_never_bought_back(self):
+        dates = pd.bdate_range("2024-01-01", periods=10)
+        prices = self._prices(dates)
+        # A stale signal for A after it delisted must not reopen the position
+        signals = pd.DataFrame({
+            "date": [dates[0], dates[7]],
+            "symbol": ["A", "A"],
+            "weight": [1.0, 1.0],
+        })
+        
+        perf = _simulate_portfolio(
+            signals, prices, 100.0, str(dates[0].date()), str(dates[-1].date()),
+            rebalance_frequency="D", transaction_cost_bps=0.0,
+        ).set_index("date")
+        
+        assert perf.loc[dates[7], "turnover"] == pytest.approx(0.0)
+        assert (perf.loc[dates[6]:, "returns"] == 0.0).all()
+    
+    def test_run_backtest_uses_raw_last_trade_dates(self, monkeypatch, tmp_path):
+        """A thin last day removed by remove_low_volume must not count as a delisting."""
+        module = importlib.import_module("qsresearch.backtest.run_backtest")
+        
+        all_dates = pd.bdate_range("2021-01-01", "2023-06-30")
+        prices = _prices_from_returns({f"S{i}": 0.0005 * i for i in range(5)}, all_dates)
+        prices["volume"] = 1_000_000.0
+        # The top-momentum symbol trades almost nothing on the final day
+        prices.loc[(prices["symbol"] == "S4") & (prices["date"] == all_dates[-1]), "volume"] = 10.0
+        monkeypatch.setattr(
+            module, "_load_price_data",
+            lambda b, s, e: prices[(prices.date >= s) & (prices.date <= e)].reset_index(drop=True),
+        )
+        config = {
+            "start_date": "2022-07-01",
+            "end_date": "2023-06-30",
+            "preprocessing": [{"name": "price_preprocessor", "params": {
+                "min_trading_days": 0, "remove_low_trading_days": False,
+                "remove_large_gaps": False, "remove_low_volume": True,
+            }}],
+            "factors": [{"name": "momentum_factor", "func": "qsresearch.features.momentum:add_qsmom_features",
+                         "params": {"slow_period": 252}}],
+            "algorithm": {"params": {"factor_column": "close_qsmom_21_252_126", "top_n": 2}},
+        }
+        
+        perf = module.run_backtest(config, output_dir=tmp_path, log_to_mlflow=False)["performance"]
+        
+        assert perf["delisted_weight"].sum() == 0.0
+        assert perf["returns"].iloc[-1] > -0.05
