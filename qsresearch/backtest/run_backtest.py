@@ -196,7 +196,7 @@ def run_backtest(
 
 def _infer_warmup_days(factors_config: list, preprocessing_config: Optional[list] = None) -> int:
     """
-    Trading days of history the configured factors and screener need before start_date.
+    Trading days of history the configured factors and preprocessors need before start_date.
 
     Uses the longest backward-looking lookback among factor params: integer
     params named '*_period' or '*_window', and lists named '*_periods' or
@@ -206,8 +206,12 @@ def _infer_warmup_days(factors_config: list, preprocessing_config: Optional[list
     
     A universe_screener step in preprocessing_config needs its full trailing
     window (lookback_days * 1.5 calendar days, in trading days) so membership
-    on start_date is judged on as much history as on any later date.
+    on start_date is judged on as much history as on any later date. A
+    price_preprocessor step that filters on history needs min_trading_days:
+    history is counted from the first loaded row, so a shorter warm-up would
+    make long-listed symbols look too young to trade on start_date.
     """
+    from qsresearch.preprocessors.price_preprocessor import DEFAULT_MIN_TRADING_DAYS
     from qsresearch.preprocessors.universe_screener import (
         DEFAULT_LOOKBACK_DAYS,
         lookback_trading_days,
@@ -223,9 +227,12 @@ def _infer_warmup_days(factors_config: list, preprocessing_config: Optional[list
             elif key.endswith(("_periods", "_windows")) and isinstance(value, (list, tuple)):
                 longest = max([longest, *(v for v in value if isinstance(v, int))])
     for step in preprocessing_config or []:
+        params = step.get("params", {})
         if step.get("name") == "universe_screener":
-            lookback_days = step.get("params", {}).get("lookback_days", DEFAULT_LOOKBACK_DAYS)
+            lookback_days = params.get("lookback_days", DEFAULT_LOOKBACK_DAYS)
             longest = max(longest, lookback_trading_days(lookback_days))
+        elif step.get("name") == "price_preprocessor" and params.get("remove_low_trading_days", True):
+            longest = max(longest, params.get("min_trading_days", DEFAULT_MIN_TRADING_DAYS) or 0)
     return longest
 
 

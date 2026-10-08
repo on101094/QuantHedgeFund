@@ -65,9 +65,11 @@ def universe_screener(
     No rows are dropped. Each row gets a boolean `universe_column` that is True
     when the symbol passes every filter on that date, using metrics over the
     trailing window (date - lookback_days * 1.5 calendar days, inclusive, up to
-    and including the date). volume_top_n ranks the symbols that pass the other
-    filters by trailing average volume across each date. Signal generators such
-    as use_factor_as_signal rank only the rows where the flag is True.
+    and including the date). An existing universe_column (e.g. the history flag
+    from preprocess_price_data) is ANDed in first. volume_top_n ranks the
+    symbols that pass the other filters by trailing average volume across each
+    date. Signal generators such as use_factor_as_signal rank only the rows
+    where the flag is True.
     
     Args:
         df: Price DataFrame
@@ -86,7 +88,8 @@ def universe_screener(
         date_column: Name of date column
         close_column: Name of close price column
         volume_column: Name of volume column
-        universe_column: Name of the eligibility column to add
+        universe_column: Name of the eligibility column to add (ANDed with
+            an existing column of that name)
     
     Returns:
         The input rows with an added boolean universe_column
@@ -96,12 +99,19 @@ def universe_screener(
     
     df = df.copy()
     
+    # Rows already excluded upstream stay excluded
+    if universe_column in df.columns:
+        prior = df[universe_column].eq(True).to_numpy()
+    else:
+        prior = np.ones(len(df), dtype=bool)
+    
     # Work on a (symbol, date)-sorted copy; results go back by position
     work = pd.DataFrame({
         "symbol": df[symbol_column].to_numpy(),
         "date": pd.to_datetime(df[date_column]).to_numpy(),
         "close": df[close_column].to_numpy(dtype=float),
         "volume": df[volume_column].to_numpy(dtype=float),
+        "prior": prior,
         "row": np.arange(len(df)),
     })
     work = work.sort_values(["symbol", "date", "row"], kind="mergesort").reset_index(drop=True)
@@ -127,7 +137,7 @@ def universe_screener(
     work["volatility"] = trailing.std()["daily_return"].to_numpy() * np.sqrt(252)
     
     # Apply filters; a NaN metric fails its filter
-    eligible = pd.Series(True, index=work.index)
+    eligible = work["prior"].copy()
     
     # Minimum average volume
     if min_avg_volume:

@@ -219,7 +219,6 @@ class TestScreenerWarmup:
         screener = lambda params: [{"name": "universe_screener", "params": params}]
         assert _infer_warmup_days(momentum["factors"], screener({"lookback_days": 100})) == 252
         assert _infer_warmup_days([], screener({"lookback_days": None})) == 0
-        assert _infer_warmup_days([], [{"name": "price_preprocessor", "params": {"min_trading_days": 504}}]) == 0
         # Factor-only calls are unchanged
         assert _infer_warmup_days(momentum["factors"]) == 252
     
