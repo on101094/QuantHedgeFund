@@ -17,6 +17,7 @@ def use_factor_as_signal(
     date_column: str = "date",
     top_n: int = 20,
     threshold: Optional[float] = None,
+    universe_column: Optional[str] = "in_universe",
 ) -> pd.DataFrame:
     """
     Use a factor column as the trading signal.
@@ -30,6 +31,8 @@ def use_factor_as_signal(
         date_column: Date column name
         top_n: Number of top stocks to select
         threshold: Optional minimum factor value threshold
+        universe_column: Boolean point-in-time eligibility column (written by
+            universe_screener); when present only flagged rows are ranked
         
     Returns:
         DataFrame with trading signals
@@ -44,13 +47,17 @@ def use_factor_as_signal(
     # Get unique dates for rebalancing
     dates = df[date_column].unique()
     
+    # Only rank symbols that are in the universe on that date
+    if universe_column and universe_column in df.columns:
+        df = df[df[universe_column].eq(True)]
+    
     signal_records = []
     
     for date in dates:
         # Symbols without a factor value (e.g. still in the lookback warm-up) can't
         # be ranked; nlargest would otherwise return them when all values are NaN
         day_data = df[(df[date_column] == date) & df[factor_column].notna()].copy()
-
+        
         # Apply threshold filter if specified
         if threshold is not None:
             day_data = day_data[day_data[factor_column] >= threshold]

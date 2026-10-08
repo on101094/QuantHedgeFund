@@ -271,7 +271,7 @@ class TestFactorSignal:
 
 
 class TestUniverseScreener:
-    def test_screener_keeps_full_history_of_passing_symbols(self):
+    def test_latest_window_screen_keeps_full_history_of_passing_symbols(self):
         from qsresearch.preprocessors import universe_screener
 
         dates = pd.bdate_range("2015-01-01", "2024-12-31")
@@ -281,6 +281,7 @@ class TestUniverseScreener:
         screened = universe_screener(
             prices, lookback_days=730, volume_top_n=None, volatility_filter=False,
             min_avg_volume=100_000, min_avg_price=4.0, min_last_price=5.0,
+            point_in_time=False,
         )
 
         # CHEAP ends far below $5 and is dropped; KEEP keeps all ten years, not
@@ -288,3 +289,106 @@ class TestUniverseScreener:
         assert set(screened["symbol"]) == {"KEEP"}
         assert screened["date"].min() == dates[0]
         assert len(screened) == len(dates)
+
+
+class TestPointInTimeScreener:
+    """Universe membership on each date may only use data up to that date."""
+
+    @staticmethod
+    def _screen(prices, **kwargs):
+        from qsresearch.preprocessors import universe_screener
+
+        params = dict(
+            lookback_days=730, volume_top_n=None, volatility_filter=False,
+            min_avg_volume=100_000, min_avg_price=4.0, min_last_price=5.0,
+        )
+        params.update(kwargs)
+        return universe_screener(prices, **params)
+
+    @staticmethod
+    def _price_path(dates, levels):
+        """Piecewise-constant close: list of (start_date, price)."""
+        close = pd.Series(np.nan, index=dates)
+        for start, price in levels:
+            close[close.index >= pd.Timestamp(start)] = price
+        return close.to_numpy()
+
+    def test_symbol_that_only_qualifies_late_is_not_eligible_early(self):
+        dates = pd.bdate_range("2018-01-01", "2023-12-29")
+        prices = pd.DataFrame({
+            "date": dates, "symbol": "LATE", "volume": 1_000_000,
+            "close": self._price_path(dates, [("2018-01-01", 2.0), ("2022-01-03", 50.0)]),
+        })
+
+        flags = self._screen(prices).set_index("date")["in_universe"]
+
+        # A penny stock until 2022: the end-of-sample screen would have kept it all along
+        assert not flags[:"2021-12-31"].any()
+        assert flags["2022-06-01":].all()
+
+    def test_symbol_that_fails_only_at_the_end_is_eligible_early(self):
+        dates = pd.bdate_range("2018-01-01", "2023-12-29")
+        prices = pd.DataFrame({
+            "date": dates, "symbol": "FADE", "volume": 1_000_000,
+            "close": self._price_path(dates, [("2018-01-01", 50.0), ("2023-06-01", 1.0)]),
+        })
+
+        point_in_time = self._screen(prices).set_index("date")["in_universe"]
+        latest_window = self._screen(prices, point_in_time=False)
+
+        # The end-of-sample screen drops FADE entirely (survivorship bias) ...
+        assert latest_window.empty
+        # ... point in time it is tradable until it actually collapses
+        assert point_in_time["2018-03-01":"2023-05-31"].all()
+        assert not point_in_time["2023-06-01":].any()
+
+    def test_needs_min_history_before_eligible(self):
+        dates = pd.bdate_range("2020-01-01", periods=60)
+        prices = pd.DataFrame({"date": dates, "symbol": "NEW", "close": 20.0, "volume": 1_000_000})
+
+        flags = self._screen(prices, min_history_days=21)["in_universe"].to_numpy()
+
+        assert not flags[:20].any() and flags[20:].all()
+
+    def test_volatility_uses_trailing_returns(self):
+        dates = pd.bdate_range("2018-01-01", "2023-12-29")
+        rets = np.zeros(len(dates))
+        calm_until = dates.get_loc(pd.Timestamp("2022-01-03"))
+        rets[calm_until:] = np.where(np.arange(len(dates) - calm_until) % 2, 0.05, -0.05)
+        prices = _prices_from_returns({"WILD": rets}, dates)
+        prices["volume"] = 1_000_000
+
+        flags = self._screen(prices, volatility_filter=True, max_volatility=0.25).set_index("date")["in_universe"]
+
+        assert flags["2018-03-01":"2021-12-31"].all()
+        assert not flags["2022-06-01":].any()
+
+    def test_volume_top_n_ranks_each_date_on_trailing_volume(self):
+        dates = pd.bdate_range("2020-01-01", "2021-12-31")
+        switch = pd.Timestamp("2021-01-04")
+        frames = []
+        for symbol, early, late in [("A", 3e6, 0.5e6), ("B", 2e6, 2e6), ("C", 1e6, 9e6)]:
+            volume = np.where(dates < switch, early, late)
+            frames.append(pd.DataFrame({"date": dates, "symbol": symbol, "close": 20.0, "volume": volume}))
+        prices = pd.concat(frames, ignore_index=True)
+
+        screened = self._screen(prices, volume_top_n=2)
+        members = screened[screened["in_universe"]].groupby("date")["symbol"].apply(frozenset)
+
+        assert members[pd.Timestamp("2020-06-01")] == {"A", "B"}
+        # Trailing averages at year two: A ~1.75M, B 2M, C ~5M
+        assert members[pd.Timestamp("2021-12-31")] == {"B", "C"}
+
+    def test_signal_only_selects_symbols_in_universe(self):
+        dates = pd.bdate_range("2024-01-01", periods=2)
+        df = pd.DataFrame({
+            "date": np.repeat(dates, 3),
+            "symbol": ["A", "B", "C"] * 2,
+            "factor": [3.0, 2.0, 1.0] * 2,
+            "in_universe": [False, True, True, True, True, True],
+        })
+
+        signals = use_factor_as_signal(df, factor_column="factor", top_n=2)
+
+        assert set(signals.loc[signals["date"] == dates[0], "symbol"]) == {"B", "C"}
+        assert set(signals.loc[signals["date"] == dates[1], "symbol"]) == {"A", "B"}
