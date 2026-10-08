@@ -60,6 +60,9 @@ def run_backtest(
             - simulation: Optional simulator settings
                 - rebalance_frequency: 'D', 'W', 'M' (default) or 'Q'
                 - transaction_cost_bps: cost per unit of turnover (default 5)
+                - warmup_days: trading days of history loaded before
+                  start_date so factors are ready on day one (default:
+                  longest factor lookback, see _infer_warmup_days)
         output_dir: Directory to save results
         log_to_mlflow: Whether to log to MLflow
         
@@ -85,7 +88,11 @@ def run_backtest(
         "transaction_cost_bps": DEFAULT_TRANSACTION_COST_BPS,
         **config.get("simulation", {}),
     }
-    
+    warmup_days = simulation_config.get("warmup_days")
+    if warmup_days is None:
+        warmup_days = _infer_warmup_days(config.get("factors", []))
+    data_start_date = _warmup_start_date(start_date, warmup_days)
+
     # MLflow setup
     if log_to_mlflow and MLFLOW_AVAILABLE:
         mlflow.set_tracking_uri(settings.mlflow_tracking_uri)
@@ -107,13 +114,20 @@ def run_backtest(
             "simulator": SIMULATOR_VERSION,
             "sim.rebalance_frequency": simulation_config["rebalance_frequency"],
             "sim.transaction_cost_bps": simulation_config["transaction_cost_bps"],
+            "sim.warmup_days": warmup_days,
+            "sim.data_start_date": data_start_date,
         })
-    
+
     try:
-        # Step 1: Load data
-        logger.info("Loading price data...")
-        price_data = _load_price_data(bundle_name, start_date, end_date)
-        
+        # Step 1: Load data, including the warm-up history before start_date.
+        # Factors are computed over all of it; the simulation starts at start_date.
+        logger.info(
+            f"Loading price data from {data_start_date} "
+            f"({warmup_days} trading days of warm-up before {start_date})..."
+        )
+        price_data = _load_price_data(bundle_name, data_start_date, end_date)
+        _check_warmup_coverage(price_data, start_date, warmup_days)
+
         # Step 2: Apply preprocessing
         logger.info("Applying preprocessing steps...")
         processed_data = _apply_preprocessing(price_data, config.get("preprocessing", []))
@@ -143,6 +157,8 @@ def run_backtest(
             "performance": performance,
             "metrics": metrics,
             "config": config,
+            "data_start_date": data_start_date,
+            "warmup_days": warmup_days,
             "run_date": datetime.now().isoformat(),
         }
         
@@ -172,6 +188,56 @@ def run_backtest(
     finally:
         if log_to_mlflow and MLFLOW_AVAILABLE:
             mlflow.end_run()
+
+
+def _infer_warmup_days(factors_config: list) -> int:
+    """
+    Trading days of history the configured factors need before their first value.
+
+    Uses the longest backward-looking lookback among factor params: integer
+    params named '*_period' or '*_window', and lists named '*_periods' or
+    '*_windows'. Forward-looking params (names starting with 'forward') are
+    skipped. A pct_change(period) has its first value once `period` bars
+    precede the current one, so `period` days of history are enough.
+    """
+    longest = 0
+    for factor_spec in factors_config:
+        for key, value in factor_spec.get("params", {}).items():
+            if key.startswith("forward"):
+                continue
+            if key.endswith(("_period", "_window")) and isinstance(value, int):
+                longest = max(longest, value)
+            elif key.endswith(("_periods", "_windows")) and isinstance(value, (list, tuple)):
+                longest = max([longest, *(v for v in value if isinstance(v, int))])
+    return longest
+
+
+def _warmup_start_date(start_date: str, warmup_days: int) -> str:
+    """
+    Calendar date to start loading data so warmup_days trading days precede start_date.
+
+    Steps back in business days with a 5% + 5 day margin for exchange holidays;
+    loading a few extra days is harmless, loading too few delays the first trade.
+    """
+    if warmup_days < 0:
+        raise ValueError(f"warmup_days must be >= 0, got {warmup_days}")
+    if warmup_days == 0:
+        return start_date
+    business_days = int(warmup_days * 1.05) + 5
+    data_start = pd.Timestamp(start_date) - pd.offsets.BDay(business_days)
+    return data_start.strftime("%Y-%m-%d")
+
+
+def _check_warmup_coverage(prices: pd.DataFrame, start_date: str, warmup_days: int) -> None:
+    """Warn when the database holds fewer trading days before start_date than the warm-up needs."""
+    dates = pd.to_datetime(prices["date"])
+    available = dates[dates < pd.Timestamp(start_date)].nunique()
+    if available < warmup_days:
+        logger.warning(
+            f"Only {available} trading days of history before {start_date} (warm-up needs "
+            f"{warmup_days}, data starts {dates.min().date()}); factors will not be ready "
+            f"on day one and the portfolio holds cash until they are"
+        )
 
 
 def _load_price_data(
@@ -231,15 +297,30 @@ def _apply_factors(
     from qsresearch.features import FactorEngine
     
     engine = FactorEngine()
-    
+
     for factor_spec in factors_config:
         name = factor_spec.get("name")
         params = factor_spec.get("params", {})
-        
-        if name:
+        func_path = factor_spec.get("func")
+
+        if name and name not in engine.BUILTIN_FACTORS and func_path:
+            # Configs name the function as "module.path:function"
+            df = _import_qsresearch_callable(func_path)(df, **params)
+            logger.info(f"Applied factor: {name} ({func_path})")
+        elif name:
             df = engine.calculate_factor(df, name, **params)
-    
+
     return df
+
+
+def _import_qsresearch_callable(func_path: str) -> Callable:
+    """Resolve a "qsresearch.module:function" path from a config."""
+    import importlib
+
+    module_path, _, func_name = func_path.partition(":")
+    if not func_name or not module_path.startswith("qsresearch."):
+        raise ValueError(f"Expected 'qsresearch.<module>:<function>', got {func_path!r}")
+    return getattr(importlib.import_module(module_path), func_name)
 
 
 def _run_algorithm(
@@ -385,6 +466,14 @@ def _simulate_portfolio(
         periods = targets.index.to_period(rebalance_frequency)
         rebalance_dates = targets.index[~periods.duplicated()]
     rebalance_set = set(rebalance_dates)
+
+    idle_days = int((asset_returns.index < targets.index[0]).sum())
+    if idle_days:
+        logger.warning(
+            f"First signal is on {targets.index[0].date()}; the portfolio holds cash for "
+            f"the first {idle_days} trading days of the window. Load more history "
+            f"before start_date (simulation.warmup_days) if factors were not ready."
+        )
     
     cost_rate = transaction_cost_bps / 10_000
     returns_matrix = asset_returns.to_numpy()

@@ -61,22 +61,23 @@ def universe_screener(
     
     df = df.copy()
     
-    # Get latest lookback_days of data
+    # Screening metrics use the latest lookback_days of data; the full history
+    # of the symbols that pass is returned (backtests need it for factor warm-up)
+    window = df
     if lookback_days:
         max_date = df[date_column].max()
         min_date = max_date - pd.Timedelta(days=lookback_days * 1.5)  # Buffer for weekends
-        df = df[df[date_column] >= min_date]
-    
+        window = df[df[date_column] >= min_date]
+
     # Calculate screening metrics per symbol
-    metrics = df.groupby(symbol_column).agg({
+    metrics = window.groupby(symbol_column).agg({
         close_column: ["mean", "std", "last"],
         volume_column: "mean",
     })
     metrics.columns = ["avg_price", "price_std", "last_price", "avg_volume"]
-    
+
     # Calculate annualized volatility
-    returns = df.groupby(symbol_column)[close_column].pct_change()
-    volatility = df.groupby(symbol_column).apply(
+    volatility = window.groupby(symbol_column).apply(
         lambda x: x[close_column].pct_change().std() * np.sqrt(252)
     )
     metrics["volatility"] = volatility

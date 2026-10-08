@@ -47,8 +47,10 @@ def use_factor_as_signal(
     signal_records = []
     
     for date in dates:
-        day_data = df[df[date_column] == date].copy()
-        
+        # Symbols without a factor value (e.g. still in the lookback warm-up) can't
+        # be ranked; nlargest would otherwise return them when all values are NaN
+        day_data = df[(df[date_column] == date) & df[factor_column].notna()].copy()
+
         # Apply threshold filter if specified
         if threshold is not None:
             day_data = day_data[day_data[factor_column] >= threshold]
