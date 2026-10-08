@@ -93,6 +93,49 @@ class TestPointInTimeHistory:
         assert set(processed["symbol"]) == {"OLD", "SHORT"}
 
 
+
+class TestPointInTimeLowVolume:
+    def _run(self, prices):
+        return _preprocess(prices, remove_low_trading_days=False, remove_low_volume=True)
+    
+    def test_early_days_are_judged_on_volume_to_date(self):
+        # GROWER trades 10k shares a day, then 1M from 2021. Its whole-sample average
+        # (about 600k) put every early day under the 10% cut, so the old filter
+        # deleted its first two years using volume it had not traded yet
+        prices = _frame("GROWER", DATES, volume=np.where(DATES < pd.Timestamp("2021-01-01"), 1e4, 1e6))
+        
+        processed = self._run(prices)
+        
+        assert len(processed) == len(DATES)
+    
+    def test_thin_day_is_still_removed(self):
+        volume = np.full(len(DATES), 1e6)
+        volume[600] = 5e3
+        prices = _frame("A", DATES, volume=volume)
+        
+        processed = self._run(prices)
+        
+        assert len(processed) == len(DATES) - 1
+        assert DATES[600] not in set(processed["date"])
+    
+    def test_removed_days_ignore_future_rows(self):
+        rng = np.random.default_rng(11)
+        frames = []
+        for i in range(6):
+            # Volume trends up or down over the sample, with occasional thin days
+            trend = np.exp(np.linspace(0.0, rng.uniform(-3.0, 3.0), len(DATES)))
+            volume = 1e5 * trend * rng.lognormal(0.0, 1.0, len(DATES))
+            frames.append(_frame(f"S{i}", DATES, volume=volume))
+        prices = pd.concat(frames, ignore_index=True)
+        keys = lambda df: set(zip(df["symbol"], df["date"]))
+        
+        full = keys(self._run(prices))
+        assert 0 < len(full) < len(prices)
+        
+        for cut in ["2020-03-31", "2021-12-31", "2023-06-30"]:
+            truncated = keys(self._run(prices[prices["date"] <= cut]))
+            assert truncated == {k for k in full if k[1] <= pd.Timestamp(cut)}
+
 class TestScreenerKeepsHistoryFlag:
     def test_young_symbol_does_not_take_a_volume_top_n_slot(self):
         # YOUNG trades five times OLD's volume but lists in 2021; with volume_top_n=1

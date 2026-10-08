@@ -400,7 +400,7 @@ cleaned_data = preprocess_price_data(
 1. **min_trading_days** - Ensures we have enough history for factor calculation. Counted point-in-time: a row is flagged `in_universe=False` until its symbol has `min_trading_days` rows up to that date, so the rows stay available for factor warm-up but can't be traded early
 2. **remove_low_trading_days** - Eliminates stocks with too many missing days
 3. **remove_large_gaps** - Removes data errors (e.g., 1000% daily moves)
-4. **remove_low_volume** - Removes stocks we couldn't actually trade
+4. **remove_low_volume** - Removes days with volume below 10% of the symbol's average volume up to that day (days we couldn't actually trade)
 
 **Universe Screener:**
 ```python

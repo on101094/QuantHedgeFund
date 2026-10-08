@@ -34,7 +34,7 @@ def preprocess_price_data(
     Performs the following cleaning steps:
     1. Flag rows where the symbol does not yet have enough trading history
     2. Remove large price gaps (corporate actions, errors)
-    3. Remove low volume periods
+    3. Remove low volume periods (vs. the symbol's average volume to date)
     4. Forward fill missing prices
     
     Args:
@@ -46,7 +46,8 @@ def preprocess_price_data(
             universe_column; symbols that never reach min_trading_days in the
             data are dropped, since none of their rows could be traded.
         remove_large_gaps: Remove suspicious price jumps
-        remove_low_volume: Filter out low volume periods
+        remove_low_volume: Remove days with volume below 10% of the symbol's
+            average volume up to and including that day
         symbol_column: Name of symbol column
         date_column: Name of date column
         open_column: Name of open price column
@@ -113,8 +114,15 @@ def preprocess_price_data(
     
     # 3. Remove low volume periods
     if remove_low_volume:
-        # Calculate average volume per symbol
-        df["_avg_vol"] = df.groupby(symbol_column)[volume_column].transform("mean")
+        # Average volume per symbol up to and including each day; a whole-sample
+        # average would let later volume decide which earlier days are dropped.
+        # df is sorted by symbol, so the grouped result lines up by position.
+        df["_avg_vol"] = (
+            df.groupby(symbol_column, sort=False, dropna=False)[volume_column]
+            .expanding()
+            .mean()
+            .to_numpy()
+        )
         
         # Remove days where volume is < 10% of average
         low_vol_mask = df[volume_column] < (df["_avg_vol"] * 0.1)
