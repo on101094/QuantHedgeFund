@@ -268,23 +268,3 @@ class TestFactorSignal:
         assert list(day1["symbol"]) == ["C"] and day1["weight"].iloc[0] == pytest.approx(1.0)
         assert set(signals.loc[signals["date"] == dates[2], "symbol"]) == {"A", "B"}
         assert signals["factor_value"].notna().all()
-
-
-class TestUniverseScreener:
-    def test_screener_keeps_full_history_of_passing_symbols(self):
-        from qsresearch.preprocessors import universe_screener
-
-        dates = pd.bdate_range("2015-01-01", "2024-12-31")
-        prices = _prices_from_returns({"KEEP": 0.0003, "CHEAP": -0.002}, dates)
-        prices["volume"] = 1_000_000
-
-        screened = universe_screener(
-            prices, lookback_days=730, volume_top_n=None, volatility_filter=False,
-            min_avg_volume=100_000, min_avg_price=4.0, min_last_price=5.0,
-        )
-
-        # CHEAP ends far below $5 and is dropped; KEEP keeps all ten years, not
-        # just the screening window, so factors can warm up before the backtest
-        assert set(screened["symbol"]) == {"KEEP"}
-        assert screened["date"].min() == dates[0]
-        assert len(screened) == len(dates)

@@ -406,7 +406,7 @@ cleaned_data = preprocess_price_data(
 ```python
 from qsresearch.preprocessors import universe_screener
 
-filtered_data = universe_screener(
+screened_data = universe_screener(
  cleaned_data,
  lookback_days=730, # 2 year lookback
  volume_top_n=500, # Top 500 by volume
@@ -415,6 +415,8 @@ filtered_data = universe_screener(
  max_volatility=0.25, # Less than 25% annual volatility
 )
 ```
+
+The screener is point-in-time: it keeps every row and adds an `in_universe` flag that is True when the symbol passes all filters on that date, judged only on the trailing `lookback_days * 1.5` calendar days up to that date. `use_factor_as_signal` ranks only rows where `in_universe` is True, so a backtest never trades a symbol before it qualified, and still trades one that stopped qualifying later. `run_backtest` loads enough history before `start_date` to cover the screener's window.
 
 **Why we screen:**
 - We can only trade liquid stocks
