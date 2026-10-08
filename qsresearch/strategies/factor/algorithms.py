@@ -18,11 +18,19 @@ def use_factor_as_signal(
     top_n: int = 20,
     threshold: Optional[float] = None,
     universe_column: Optional[str] = "in_universe",
+    weighting: str = "slot",
 ) -> pd.DataFrame:
     """
     Use a factor column as the trading signal.
     
     Selects top N stocks by factor value for each rebalancing period.
+    
+    When fewer than top_n symbols qualify (thin universe, threshold), the
+    weighting decides what happens to the spare capital:
+    - "slot" (default): every pick gets 1 / top_n and unfilled slots stay in
+      cash, so a shrinking universe never concentrates the book.
+    - "equal": the picks share the whole book (1 / number of picks), so a
+      universe of 4 names means 25% positions.
     
     Args:
         df: DataFrame with factor values
@@ -33,12 +41,15 @@ def use_factor_as_signal(
         threshold: Optional minimum factor value threshold
         universe_column: Boolean point-in-time eligibility column (written by
             universe_screener); when present only flagged rows are ranked
+        weighting: "slot" or "equal" (see above)
         
     Returns:
         DataFrame with trading signals
     """
     if factor_column not in df.columns:
         raise ValueError(f"Factor column '{factor_column}' not found in DataFrame")
+    if weighting not in ("slot", "equal"):
+        raise ValueError(f"weighting must be 'slot' or 'equal', got {weighting!r}")
     
     logger.info(f"Generating signals using {factor_column}, top {top_n}")
     
@@ -66,7 +77,10 @@ def use_factor_as_signal(
         day_data = day_data.nlargest(top_n, factor_column)
         
         # Equal weight the selected stocks
-        weight = 1.0 / len(day_data) if len(day_data) > 0 else 0
+        if weighting == "slot":
+            weight = 1.0 / top_n
+        else:
+            weight = 1.0 / len(day_data) if len(day_data) > 0 else 0
         
         for _, row in day_data.iterrows():
             signal_records.append({

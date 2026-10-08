@@ -19,6 +19,7 @@ def universe_screener(
     max_percent_change: float = 0.35,
     volatility_filter: bool = True,
     max_volatility: float = 0.25,
+    max_volatility_percentile: Optional[float] = None,
     min_avg_volume: int = 100_000,
     min_avg_price: float = 4.0,
     min_last_price: float = 5.0,
@@ -60,6 +61,10 @@ def universe_screener(
         max_percent_change: Maximum allowed daily change
         volatility_filter: Filter high volatility stocks
         max_volatility: Maximum allowed annualized volatility
+        max_volatility_percentile: Relative cap, e.g. 0.8 drops the most
+            volatile 20% of the remaining symbols on each date. Unlike the
+            absolute cap it keeps the universe size stable when volatility
+            rises market-wide.
         min_avg_volume: Minimum average daily volume
         min_avg_price: Minimum average price
         min_last_price: Minimum last traded price
@@ -87,6 +92,7 @@ def universe_screener(
             volume_top_n=volume_top_n,
             volatility_filter=volatility_filter,
             max_volatility=max_volatility,
+            max_volatility_percentile=max_volatility_percentile,
             min_avg_volume=min_avg_volume,
             min_avg_price=min_avg_price,
             min_last_price=min_last_price,
@@ -150,6 +156,11 @@ def universe_screener(
         valid_symbols = [s for s, v in vol_filter.items() if v]
         logger.debug(f"Volatility filter removed {filtered_out} symbols")
     
+    # Relative volatility cap
+    if max_volatility_percentile is not None and valid_symbols:
+        vol_pct = metrics.loc[valid_symbols, "volatility"].rank(pct=True)
+        valid_symbols = [s for s, v in (vol_pct <= max_volatility_percentile).items() if v]
+    
     # Top N by volume
     if volume_top_n and len(valid_symbols) > volume_top_n:
         top_by_volume = (
@@ -178,6 +189,7 @@ def _point_in_time_screen(
     volume_top_n: Optional[int],
     volatility_filter: bool,
     max_volatility: float,
+    max_volatility_percentile: Optional[float],
     min_avg_volume: Optional[float],
     min_avg_price: Optional[float],
     min_last_price: Optional[float],
@@ -233,6 +245,12 @@ def _point_in_time_screen(
     # Respect earlier point-in-time flags (e.g. price_preprocessor's history rule)
     if universe_column in df.columns:
         eligible &= df[universe_column].eq(True).to_numpy()
+    
+    # Relative volatility cap among that date's eligible symbols
+    if max_volatility_percentile is not None:
+        eligible_vol = pd.Series(np.where(eligible, volatility, np.nan), index=df.index)
+        vol_pct = eligible_vol.groupby(df[date_column]).rank(pct=True)
+        eligible &= (vol_pct <= max_volatility_percentile).to_numpy()
     
     # Top N by trailing average volume among that date's eligible symbols
     if volume_top_n:

@@ -265,7 +265,8 @@ class TestFactorSignal:
 
         assert dates[0] not in set(signals["date"])
         day1 = signals[signals["date"] == dates[1]]
-        assert list(day1["symbol"]) == ["C"] and day1["weight"].iloc[0] == pytest.approx(1.0)
+        # One qualifying name fills one of two slots; the other half stays cash
+        assert list(day1["symbol"]) == ["C"] and day1["weight"].iloc[0] == pytest.approx(0.5)
         assert set(signals.loc[signals["date"] == dates[2], "symbol"]) == {"A", "B"}
         assert signals["factor_value"].notna().all()
 
@@ -499,3 +500,77 @@ class TestPointInTimePricePreprocessor:
         assert results["warmup_days"] == 504
         assert perf["date"].iloc[0] == pd.Timestamp("2022-01-03")
         assert perf["turnover"].iloc[0] == pytest.approx(1.0)
+
+
+class TestThinUniverse:
+    """A universe smaller than top_n must not concentrate the book."""
+
+    @staticmethod
+    def _thin_day():
+        return pd.DataFrame({
+            "date": pd.Timestamp("2024-01-02"),
+            "symbol": list("ABCDEFG"),
+            "factor": [7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0],
+            "in_universe": [True, True, True, False, False, False, False],
+        })
+
+    def test_slot_weighting_leaves_unfilled_slots_in_cash(self):
+        signals = use_factor_as_signal(self._thin_day(), factor_column="factor", top_n=5)
+
+        assert set(signals["symbol"]) == {"A", "B", "C"}
+        assert signals["weight"].tolist() == pytest.approx([0.2, 0.2, 0.2])
+
+    def test_equal_weighting_spreads_the_book_over_the_picks(self):
+        signals = use_factor_as_signal(
+            self._thin_day(), factor_column="factor", top_n=5, weighting="equal",
+        )
+
+        assert signals["weight"].tolist() == pytest.approx([1 / 3] * 3)
+
+    def test_unknown_weighting_raises(self):
+        with pytest.raises(ValueError):
+            use_factor_as_signal(self._thin_day(), factor_column="factor", weighting="cap")
+
+    def test_simulated_book_is_partly_cash_with_slot_weighting(self):
+        dates = pd.bdate_range("2024-01-01", periods=10)
+        prices = _prices_from_returns({s: 0.01 for s in "ABCDEFG"}, dates)
+        prices["factor"] = prices["symbol"].map({s: 7.0 - i for i, s in enumerate("ABCDEFG")})
+        prices["in_universe"] = prices["symbol"].isin(["A", "B", "C"])
+
+        signals = use_factor_as_signal(prices, factor_column="factor", top_n=5)
+        perf = _simulate_portfolio(
+            signals, prices, 100.0, "2024-01-01", "2024-01-12", transaction_cost_bps=0.0,
+        )
+
+        # 60% invested in names returning 1% a day, 40% in cash
+        assert perf["returns"].iloc[1] == pytest.approx(0.006)
+
+    def test_relative_volatility_cap_keeps_universe_size_when_volatility_rises(self):
+        from qsresearch.preprocessors import universe_screener
+
+        dates = pd.bdate_range("2018-01-01", "2023-12-29")
+        regime = np.where(dates >= pd.Timestamp("2021-01-04"), 3.0, 1.0)  # vol triples market-wide
+        rng = np.random.default_rng(2)
+        frames = []
+        for i in range(10):
+            rets = rng.normal(0, 0.006 * (1 + 0.15 * i), len(dates)) * regime
+            frame = _prices_from_returns({f"S{i}": rets}, dates)
+            frame["volume"] = 1_000_000
+            frames.append(frame)
+        prices = pd.concat(frames, ignore_index=True)
+        common = dict(lookback_days=730, volume_top_n=None, min_history_days=21)
+
+        absolute = universe_screener(prices, volatility_filter=True, max_volatility=0.25, **common)
+        relative = universe_screener(
+            prices, volatility_filter=False, max_volatility_percentile=0.8, **common,
+        )
+        count = lambda df: df[df["in_universe"]].groupby("date")["symbol"].nunique()
+
+        # The absolute cap empties out once volatility rises; the relative cap
+        # always keeps the calmest 80% (8 of 10)
+        assert count(absolute).reindex(dates[dates >= "2023-01-02"], fill_value=0).max() < 3
+        late = count(relative)[dates[dates >= "2019-01-02"]]
+        assert (late == 8).all()
+        # And it drops the most volatile names, not arbitrary ones
+        last_day = relative[(relative["date"] == dates[-1]) & relative["in_universe"]]
+        assert set(last_day["symbol"]) == {f"S{i}" for i in range(8)}
