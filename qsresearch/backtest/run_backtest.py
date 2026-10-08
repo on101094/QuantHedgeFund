@@ -61,8 +61,8 @@ def run_backtest(
                 - rebalance_frequency: 'D', 'W', 'M' (default) or 'Q'
                 - transaction_cost_bps: cost per unit of turnover (default 5)
                 - warmup_days: trading days of history loaded before
-                  start_date so factors are ready on day one (default:
-                  longest factor lookback, see _infer_warmup_days)
+                  start_date so factors and point-in-time history rules
+                  are ready on day one (default: see _infer_warmup_days)
         output_dir: Directory to save results
         log_to_mlflow: Whether to log to MLflow
         
@@ -90,7 +90,7 @@ def run_backtest(
     }
     warmup_days = simulation_config.get("warmup_days")
     if warmup_days is None:
-        warmup_days = _infer_warmup_days(config.get("factors", []))
+        warmup_days = _infer_warmup_days(config.get("factors", []), config.get("preprocessing", []))
     data_start_date = _warmup_start_date(start_date, warmup_days)
 
     # MLflow setup
@@ -190,17 +190,29 @@ def run_backtest(
             mlflow.end_run()
 
 
-def _infer_warmup_days(factors_config: list) -> int:
+def _infer_warmup_days(factors_config: list, preprocessing_config: Optional[list] = None) -> int:
     """
-    Trading days of history the configured factors need before their first value.
+    Trading days of history needed before start_date so the strategy can trade on day one.
 
     Uses the longest backward-looking lookback among factor params: integer
     params named '*_period' or '*_window', and lists named '*_periods' or
     '*_windows'. Forward-looking params (names starting with 'forward') are
     skipped. A pct_change(period) has its first value once `period` bars
     precede the current one, so `period` days of history are enough.
+
+    Point-in-time preprocessing also needs history: price_preprocessor only
+    flags a symbol tradable after min_trading_days, and universe_screener
+    after min_history_days.
     """
     longest = 0
+    for step in preprocessing_config or []:
+        params = step.get("params", {})
+        if not params.get("point_in_time", True):
+            continue
+        if step.get("name") == "price_preprocessor" and params.get("remove_low_trading_days", True):
+            longest = max(longest, params.get("min_trading_days", 504))
+        elif step.get("name") == "universe_screener":
+            longest = max(longest, params.get("min_history_days", 21))
     for factor_spec in factors_config:
         for key, value in factor_spec.get("params", {}).items():
             if key.startswith("forward"):

@@ -392,3 +392,110 @@ class TestPointInTimeScreener:
 
         assert set(signals.loc[signals["date"] == dates[0], "symbol"]) == {"B", "C"}
         assert set(signals.loc[signals["date"] == dates[1], "symbol"]) == {"A", "B"}
+
+
+class TestPointInTimePricePreprocessor:
+    """price_preprocessor rules may only use data up to each row's date."""
+
+    @staticmethod
+    def _prices(dates, symbol="A", volume=1_000_000):
+        return pd.DataFrame({
+            "date": dates, "symbol": symbol, "open": 20.0, "high": 20.0, "low": 20.0,
+            "close": 20.0, "volume": volume,
+        })
+
+    def test_history_rule_flags_rows_instead_of_trusting_total_length(self):
+        from qsresearch.preprocessors import preprocess_price_data
+
+        dates = pd.bdate_range("2020-01-01", periods=600)
+        prices = self._prices(dates)
+
+        point_in_time = preprocess_price_data(prices, min_trading_days=504)
+        whole_sample = preprocess_price_data(prices, min_trading_days=504, point_in_time=False)
+
+        # 600 rows in total pass the whole-sample rule from day one; point in
+        # time the symbol only has 504 days of history from its 504th bar
+        assert len(whole_sample) == 600 and "in_universe" not in whole_sample
+        flags = point_in_time["in_universe"].to_numpy()
+        assert not flags[:503].any() and flags[503:].all()
+
+    def test_symbol_that_never_has_enough_history_is_dropped(self):
+        from qsresearch.preprocessors import preprocess_price_data
+
+        prices = pd.concat([
+            self._prices(pd.bdate_range("2020-01-01", periods=600), "OLD"),
+            self._prices(pd.bdate_range("2021-06-01", periods=100), "NEW"),
+        ], ignore_index=True)
+
+        result = preprocess_price_data(prices, min_trading_days=504)
+
+        assert set(result["symbol"]) == {"OLD"}
+
+    def test_low_volume_is_judged_against_trailing_volume(self):
+        from qsresearch.preprocessors import preprocess_price_data
+
+        dates = pd.bdate_range("2020-01-01", periods=600)
+        volume = np.full(len(dates), 100_000.0)
+        volume[300:] = 10_000_000.0  # volume grows 100x later on
+        volume[450] = 50_000.0       # a genuinely thin day relative to its past
+        prices = self._prices(dates, volume=volume)
+        kwargs = dict(remove_low_trading_days=False, remove_large_gaps=False)
+
+        point_in_time = preprocess_price_data(prices, **kwargs)
+        whole_sample = preprocess_price_data(prices, point_in_time=False, **kwargs)
+
+        # The whole-sample average (~5M) makes every early day look thin
+        assert whole_sample["date"].min() == dates[300]
+        # Point in time the early days are normal; only day 450 is removed
+        assert set(dates) - set(point_in_time["date"]) == {dates[450]}
+
+    def test_screener_respects_existing_flag(self):
+        from qsresearch.preprocessors import preprocess_price_data, universe_screener
+
+        dates = pd.bdate_range("2020-01-01", periods=600)
+        prices = self._prices(dates)
+
+        flagged = preprocess_price_data(prices, min_trading_days=504, remove_low_volume=False)
+        screened = universe_screener(flagged, volume_top_n=None, volatility_filter=False)
+
+        flags = screened["in_universe"].to_numpy()
+        assert not flags[:503].any() and flags[503:].all()
+
+    def test_warmup_covers_history_rule(self):
+        from qsresearch.backtest.run_backtest import _infer_warmup_days
+        from qsresearch.strategies.factor.config import MOMENTUM_FACTOR_CONFIG
+
+        config = MOMENTUM_FACTOR_CONFIG
+        assert _infer_warmup_days(config["factors"], config["preprocessing"]) == 504
+        whole_sample = [{"name": "price_preprocessor", "params": {"min_trading_days": 504, "point_in_time": False}}]
+        assert _infer_warmup_days(config["factors"], whole_sample) == 252
+
+    def test_run_backtest_with_preprocessing_trades_from_start_date(self, monkeypatch, tmp_path):
+        module = importlib.import_module("qsresearch.backtest.run_backtest")
+
+        all_dates = pd.bdate_range("2019-01-01", "2023-06-30")
+        rng = np.random.default_rng(1)
+        prices = _prices_from_returns(
+            {f"S{i}": rng.normal(0.0003 * (i - 3), 0.01, len(all_dates)) for i in range(8)},
+            all_dates,
+        )
+        prices["volume"] = 1_000_000
+        monkeypatch.setattr(
+            module, "_load_price_data",
+            lambda b, s, e: prices[(prices.date >= s) & (prices.date <= e)].reset_index(drop=True),
+        )
+        config = {
+            "start_date": "2022-01-03",
+            "end_date": "2023-06-30",
+            "preprocessing": [{"name": "price_preprocessor", "params": {"min_trading_days": 504}}],
+            "factors": [{"name": "momentum_factor", "func": "qsresearch.features.momentum:add_qsmom_features",
+                         "params": {"slow_period": 252}}],
+            "algorithm": {"params": {"factor_column": "close_qsmom_21_252_126", "top_n": 3}},
+        }
+
+        results = module.run_backtest(config, output_dir=tmp_path, log_to_mlflow=False)
+        perf = results["performance"]
+
+        assert results["warmup_days"] == 504
+        assert perf["date"].iloc[0] == pd.Timestamp("2022-01-03")
+        assert perf["turnover"].iloc[0] == pytest.approx(1.0)

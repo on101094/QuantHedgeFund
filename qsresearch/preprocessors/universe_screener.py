@@ -43,8 +43,9 @@ def universe_screener(
     - point_in_time=True (default, for backtests): every row is kept and gets a
       boolean `universe_column` saying whether the symbol passes the screen on
       that date, using only data up to and including that date (trailing
-      window of lookback_days * 1.5 calendar days). Symbols that never pass
-      are dropped. Strategies should only select rows where the flag is True.
+      window of lookback_days * 1.5 calendar days), ANDed with any existing
+      flag. Symbols that never pass are dropped. Strategies should only
+      select rows where the flag is True.
     - point_in_time=False (for picking today's universe): the screen is run
       once on the latest window and passing symbols are kept with their full
       history. Using this in a backtest picks the universe with knowledge of
@@ -229,6 +230,9 @@ def _point_in_time_screen(
         eligible &= df[close_column].to_numpy() >= min_last_price
     if volatility_filter:
         eligible &= volatility <= max_volatility
+    # Respect earlier point-in-time flags (e.g. price_preprocessor's history rule)
+    if universe_column in df.columns:
+        eligible &= df[universe_column].eq(True).to_numpy()
     
     # Top N by trailing average volume among that date's eligible symbols
     if volume_top_n:
