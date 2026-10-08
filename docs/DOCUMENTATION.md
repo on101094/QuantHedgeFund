@@ -1057,8 +1057,12 @@ sweep_config = {
 }
 
 # This tests 3 × 3 × 4 = 36 combinations
-results = run_iterative_sweep(sweep_config)
+sweep = run_iterative_sweep(sweep_config)
 ```
+
+Picking the combination with the best full-sample Sharpe is in-sample selection: with 36 tries, one will look good by luck. The sweep therefore selects walk-forward. Each test window (default 126 trading days) holds the combination with the best Sharpe over the training window before it (default 504 days, `sweep_config["walk_forward"]`), and switching combinations costs 2x the trading cost. `sweep["walk_forward"]["oos_sharpe"]` is the out-of-sample Sharpe of those choices joined together, the figure to judge the strategy by. `sweep["selected_params"]` is the choice on the most recent training window.
+
+**Delistings:** a symbol that stops trading before the data ends takes `simulation.delisting_return` (default -30%) on the day after its last trade, and the rest of the position moves to cash. The data has no delisting returns or reasons, so -30% is an assumption (the usual replacement for a performance-related delisting). It is conservative for takeovers and ticker changes.
 
 ### Multi-Factor Strategies
 
